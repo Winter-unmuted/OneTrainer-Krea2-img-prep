@@ -12,27 +12,27 @@ OneTrainer sorts images into aspect-ratio buckets and scales/crops each one to f
 
 **Place exact-size crop boxes.** Wheel to cycle bucket sizes, click to drop a box. The box is a real bucket resolution (e.g. 896x1152), cut verbatim, no resampling.
 
-![place boxes](docs/place.png)
+<img width="2248" height="1394" alt="image" src="https://github.com/user-attachments/assets/d853e83b-8654-4e0f-a895-58f78d001b2b" />
 
 **Snap to bucket.** Downscale the image so the whole thing fills the closest bucket with minimal loss. Arrows / Ctrl+←→ step through the best fits, `>` marks the one you're on.
 
-![snap](docs/snap.png)
+<img width="1015" height="1003" alt="image" src="https://github.com/user-attachments/assets/d4a5e6de-4354-4166-a896-7ef43b1d0077" />
 
 **Rotate / flip.** 90° turns and H/V flips, applied to the pixels (WYSIWYG). Clones off if the image already has boxes.
 
 **Bucket-colored sizes.** Blue = smallest target, red = largest. Same colors in the size list and the snap menu.
 
-![colors](docs/colors.png)
+<img width="325" height="880" alt="image" src="https://github.com/user-attachments/assets/b3964b7b-69fa-4c9c-b58d-1e2246f59bde" />
 
 **Output ready for OneTrainer.** Crops go to `crops/512`, `crops/768`, `crops/1024` etc., one folder per target family, mixed dimensions inside. Output field takes a path, not just a name: `crops`, `crops/train`, `../shared/crops`, or an absolute path. Change it per batch to split runs.
 
 **Bucket tally.** Counts each size on disk and, given your batch size, shows batches formed and images dropped per epoch (OneTrainer drops the remainder of any bucket that isn't a multiple of batch size, and skips buckets smaller than one batch).
 
-![tally](docs/tally.png)
+<img width="837" height="1001" alt="image" src="https://github.com/user-attachments/assets/0bd0b83f-5eef-442d-8505-8be7521bebd2" />
 
 **Similarity sort + exclude.** Sort the file list by color-histogram similarity (size- and crop-tolerant), seeded from the biggest image so clusters fall next to each other. Mark junk/dupes as excluded and they drop to the bottom of every sort.
 
-![similarity](docs/similarity.png)
+<img width="714" height="751" alt="image" src="https://github.com/user-attachments/assets/d8c9f6bb-6f87-4f44-b717-d76e24e82434" />
 
 Plus: dark mode, sortable file list (name / megapixels / crop count / similarity), Crop All, per-session save/resume, no-upscale hard rule.
 
@@ -55,7 +55,7 @@ Plus: dark mode, sortable file list (name / megapixels / crop count / similarity
 
 ## OneTrainer setup
 
-One concept per output folder, Resolution Override **on** for each:
+**One concept per output folder**, Resolution Override **on** for each:
 
 - path `crops/512`, Resolution Override on, value `512`
 - path `crops/768`, Resolution Override on, value `768`
