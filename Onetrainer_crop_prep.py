@@ -897,12 +897,17 @@ class CropApp:
 
     def _go_to(self, target_item, from_tree=False):
         """Select target_item. If an excluded image is waiting to be settled
-        and we're actually leaving it, re-sort now (so the trashed one sinks)
-        and land on target_item by identity."""
+        and we're actually leaving it, move trashed items to the bottom now
+        (preserving everyone else's order) and land on target_item by identity."""
         leaving = self.items[self.cur_idx] if self.items else None
         resorted = False
         if self._pending_resort and target_item is not leaving:
-            self.items = self._ordered_items()
+            # stable partition: keep current order, just sink excluded ones.
+            # (Do NOT re-run the full sort here — that would reshuffle the
+            # similarity chain and throw the view around.)
+            active = [it for it in self.items if not it.excluded]
+            excluded = [it for it in self.items if it.excluded]
+            self.items = active + excluded
             self._populate_tree()
             self._pending_resort = False
             resorted = True
