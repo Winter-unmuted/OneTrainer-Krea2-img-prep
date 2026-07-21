@@ -259,6 +259,7 @@ class CropApp:
         self.selected_box = None
         self.ghost_xy = None
         self.sel_size_idx = 0
+        self._pending_resort = False
 
         self.root.title(f"Krea2 Crop Tool - {self.folder}")
         self._scan_folder()
@@ -836,6 +837,7 @@ class CropApp:
         cur_uid = self.items[self.cur_idx].uid \
             if 0 <= self.cur_idx < len(self.items) else None
         self.items = self._ordered_items()
+        self._pending_resort = False
         if cur_uid is not None:
             for i, it in enumerate(self.items):
                 if it.uid == cur_uid:
@@ -852,11 +854,13 @@ class CropApp:
             return
         item = self.items[self.cur_idx]
         item.excluded = not item.excluded
+        self._refresh_tree_row(item)          # grey it in place, don't move yet
+        self._pending_resort = True           # settle when we leave this photo
         self._save_session()
-        self._sort_items()   # re-sort so it sinks / rises immediately
         self._set_status(
             f"'{os.path.basename(item.src_name)}' "
-            f"{'excluded' if item.excluded else 'included'}.")
+            f"{'excluded' if item.excluded else 'included'} "
+            f"(sinks when you move to another image).")
 
     def _populate_tree(self):
         self.tree.delete(*self.tree.get_children())
@@ -883,13 +887,27 @@ class CropApp:
         if not sel:
             return
         uid = int(sel[0])
-        for i, it in enumerate(self.items):
+        for it in self.items:
             if it.uid == uid:
-                if i != self.cur_idx:
-                    self._select_item(i, from_tree=True)
+                if it is not self.items[self.cur_idx]:
+                    self._go_to(it, from_tree=True)
                 return
 
     # ---------------------------------------------------------- selection ---
+
+    def _go_to(self, target_item, from_tree=False):
+        """Select target_item. If an excluded image is waiting to be settled
+        and we're actually leaving it, re-sort now (so the trashed one sinks)
+        and land on target_item by identity."""
+        leaving = self.items[self.cur_idx] if self.items else None
+        resorted = False
+        if self._pending_resort and target_item is not leaving:
+            self.items = self._ordered_items()
+            self._populate_tree()
+            self._pending_resort = False
+            resorted = True
+        idx = self.items.index(target_item)
+        self._select_item(idx, from_tree=(from_tree and not resorted))
 
     def _select_item(self, idx, from_tree=False):
         self.cur_idx = max(0, min(idx, len(self.items) - 1))
@@ -915,8 +933,10 @@ class CropApp:
         self._redraw(full=True)
 
     def _nav(self, step):
-        if self.items:
-            self._select_item(self.cur_idx + step)
+        if not self.items:
+            return
+        idx = max(0, min(self.cur_idx + step, len(self.items) - 1))
+        self._go_to(self.items[idx])
 
     def _nav_with_crops(self, step):
         """Jump to the next image (in the given direction) that has >0 boxes."""
@@ -925,7 +945,7 @@ class CropApp:
         i = self.cur_idx + step
         while 0 <= i < len(self.items):
             if self.items[i].boxes:
-                self._select_item(i)
+                self._go_to(self.items[i])
                 return
             i += step
         self._set_status("No further images with crops in that direction.")
