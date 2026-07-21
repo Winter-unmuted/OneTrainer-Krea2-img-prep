@@ -61,7 +61,14 @@ Plus: dark mode, sortable file list (name / megapixels / crop count / similarity
 - path `crops/768`, Resolution Override on, value `768`
 - path `crops/1024`, Resolution Override on, value `1024`
 
+<img width="805" height="547" alt="image" src="https://github.com/user-attachments/assets/9a99d95b-dff6-4464-93e7-e17e2f42a6df" />
+
+
 Aspect bucketing on, crop jitter off. Each concept accepts mixed sizes and routes every pre-cut image to its own bucket at scale 1.0. Don't put a comma list on one folder or the random per-image target roll will downscale things.
+
+Note that each concept size is the total number of pixels, so multiple aspect ratios will be in each concept. You can inspect this with the concept statistics in OneTrainer.
+
+<img width="1426" height="804" alt="image" src="https://github.com/user-attachments/assets/724daed9-adb3-40a7-8924-37bf2fa15152" />
 
 ## Run
 
@@ -71,5 +78,6 @@ python krea2_crop_tool.py
 ```
 
 Pick your resolutions (e.g. `512, 768, 1024`) and a folder. Crops land in `<folder>/crops/`.
+Note you can include subdirectories, or start in a subdirectory and save up levels with ../ in the file path box.
 
 numpy is only needed for the similarity sort; everything else runs on Pillow alone. Windows / tkinter. Reads EXIF orientation. Exports JPEG q100 4:4:4 with the source filename in the comment.
