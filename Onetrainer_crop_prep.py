@@ -116,7 +116,9 @@ FILE_SORT_NAME = "Name (A\u2192Z)"
 FILE_SORT_MP = "Megapixels (high\u2192low)"
 FILE_SORT_CROPS = "Crop boxes (most\u2192few)"
 FILE_SORT_SIM = "Similarity (clustered)"
-FILE_SORT_MODES = [FILE_SORT_NAME, FILE_SORT_MP, FILE_SORT_CROPS, FILE_SORT_SIM]
+FILE_SORT_QUAL = "Quality (worst first)"
+FILE_SORT_MODES = [FILE_SORT_NAME, FILE_SORT_MP, FILE_SORT_CROPS, FILE_SORT_SIM,
+                   FILE_SORT_QUAL]
 
 
 def sort_buckets(buckets: list[tuple[int, int, int]], mode: str
@@ -256,6 +258,7 @@ class CropApp:
         self.thumb_cache = {}
         self.dim_cache = {}
         self._feat_cache = {}
+        self._qual_cache = {}
         self.selected_box = None
         self.ghost_xy = None
         self.sel_size_idx = 0
@@ -503,6 +506,7 @@ class CropApp:
                  "Del: delete | Arrows: nudge | PgUp/PgDn: images | C: crop | "
                  "Ctrl+D: clone | \u25c0\u25b6 by slider: snap to best-fit bucket | "
                  "Ctrl+\u2191/\u2193: jump to next image with crops | "
+                 "Alt+\u2191/\u2193: jump to next image without crops | "
                  "Ctrl+T: exclude | Esc: deselect")
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
 
@@ -527,7 +531,8 @@ class CropApp:
         # right: image browser
         right = ttk.Frame(main, padding=4)
         right.pack(side=tk.RIGHT, fill=tk.Y)
-        ttk.Label(right, text="Images  (Ctrl+\u2191/\u2193: jump to next with crops)"
+        ttk.Label(right, text="Images  (Ctrl+\u2191/\u2193: with crops, "
+                              "Alt+\u2191/\u2193: without crops)"
                   ).pack(side=tk.TOP, anchor=tk.W)
         sort_row = ttk.Frame(right)
         sort_row.pack(side=tk.TOP, fill=tk.X, pady=(2, 2))
@@ -549,6 +554,8 @@ class CropApp:
                    command=self._reset_exports_all).pack(fill=tk.X, pady=(2, 0))
         ttk.Button(btns, text="Tally output buckets",
                    command=self._tally_buckets).pack(fill=tk.X, pady=(2, 0))
+        ttk.Button(btns, text="Quality report",
+                   command=self._open_quality_report).pack(fill=tk.X, pady=(2, 0))
 
         tree_wrap = ttk.Frame(right)
         tree_wrap.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -594,6 +601,8 @@ class CropApp:
         self.root.bind("<Control-d>", lambda e: self._clone_current())
         self.root.bind("<Control-Up>", lambda e: self._nav_with_crops(-1))
         self.root.bind("<Control-Down>", lambda e: self._nav_with_crops(+1))
+        self.root.bind("<Alt-Up>", lambda e: self._nav_without_crops(-1))
+        self.root.bind("<Alt-Down>", lambda e: self._nav_without_crops(+1))
         self.root.bind("<Control-Left>", lambda e: self._snap_step(-1))
         self.root.bind("<Control-Right>", lambda e: self._snap_step(+1))
         self.root.bind("<Control-t>", lambda e: self._toggle_exclude_current())
@@ -790,7 +799,112 @@ class CropApp:
             self._feat_cache[src_name] = f
         return f
 
-    def _similarity_order(self, items):
+    def _quality_metrics(self, src_name):
+        """No-reference quality signals on the ORIGINAL image (uncropped,
+        unrotated) so JPEG block alignment stays valid where relevant:
+
+        sharp  = variance of Laplacian on a size-normalized grayscale
+                 (higher = sharper; content-dependent -- a flat sky reads as
+                 'blurry' even in perfect focus, so this ranks/prioritizes
+                 rather than proves defocus).
+        cast   = max pairwise channel-mean gap (gray-world color cast, 0-255).
+                 Flags a systematic tint; does not judge deliberately warm/
+                 cool scenes -- a sunset will show cast too.
+        clip   = % of pixels blown (>=253) or crushed (<=2) in any one
+                 channel -- lost highlight/shadow detail.
+        block  = 8x8 JPEG block-edge discontinuity vs interior discontinuity.
+                 Near zero for unprocessed/PNG sources; rises with
+                 recompression artifacts.
+        Cached per source file."""
+        m = self._qual_cache.get(src_name)
+        if m is not None:
+            return m
+        if not HAS_NUMPY:
+            m = {"sharp": 0.0, "cast": 0.0, "clip": 0.0, "block": 0.0}
+            self._qual_cache[src_name] = m
+            return m
+        try:
+            orig = self._get_original(src_name)
+            w, h = orig.size
+            # cap analysis size for speed; keep crop origin divisible by 8 so
+            # the JPEG block grid (if any) stays aligned
+            cw, ch = min(w, 2000), min(h, 2000)
+            cw -= cw % 8
+            ch -= ch % 8
+            cw, ch = max(cw, 8), max(ch, 8)
+            region = orig.crop((0, 0, cw, ch))
+            gray = np.asarray(region.convert("L"), dtype=np.float32)
+            rgb_small = np.asarray(
+                region.convert("RGB").resize((128, 128), Image.Resampling.BILINEAR),
+                dtype=np.float32)
+
+            # sharpness: normalize the working size so blur reads consistently
+            # across different source resolutions
+            long_side = max(cw, ch)
+            if long_side > 1200:
+                s = 1200 / long_side
+                sg = np.asarray(
+                    Image.fromarray(gray.astype(np.uint8)).resize(
+                        (max(1, int(cw * s)), max(1, int(ch * s))),
+                        Image.Resampling.BILINEAR), dtype=np.float32)
+            else:
+                sg = gray
+            lap = (-4 * sg[1:-1, 1:-1] + sg[:-2, 1:-1] + sg[2:, 1:-1]
+                   + sg[1:-1, :-2] + sg[1:-1, 2:])
+            sharp = float(lap.var()) if lap.size else 0.0
+
+            means = rgb_small.reshape(-1, 3).mean(axis=0)
+            cast = float(max(abs(means[0] - means[1]),
+                             abs(means[1] - means[2]),
+                             abs(means[0] - means[2])))
+
+            hi = (rgb_small >= 253).mean(axis=(0, 1))
+            lo = (rgb_small <= 2).mean(axis=(0, 1))
+            clip = float(max(hi.max(), lo.max()) * 100.0)
+
+            dcol = np.abs(np.diff(gray, axis=1))
+            drow = np.abs(np.diff(gray, axis=0))
+            cols = np.arange(dcol.shape[1])
+            rows = np.arange(drow.shape[0])
+            bh = (dcol[:, (cols % 8) == 7].mean() - dcol[:, (cols % 8) != 7].mean()
+                  if dcol.shape[1] > 8 else 0.0)
+            bv = (drow[(rows % 8) == 7, :].mean() - drow[(rows % 8) != 7, :].mean()
+                  if drow.shape[0] > 8 else 0.0)
+            block = float(max(0.0, (bh + bv) / 2))
+
+            m = {"sharp": sharp, "cast": cast, "clip": clip, "block": block}
+        except Exception:
+            m = {"sharp": 0.0, "cast": 0.0, "clip": 0.0, "block": 0.0}
+        self._qual_cache[src_name] = m
+        return m
+
+    def _quality_badness_ranks(self, items):
+        """Percentile-rank each metric across `items` (0=best, 1=worst), then
+        combine as the max across metrics -- an image is 'bad' if ANY one
+        signal is bad, not just on average."""
+        if not items:
+            return {}
+        metrics = {it.uid: self._quality_metrics(it.src_name) for it in items}
+        uids = list(metrics.keys())
+
+        def ranks_for(key, reverse_good):
+            # reverse_good=True means LOWER raw value = worse (sharpness);
+            # False means HIGHER raw value = worse (cast/clip/block)
+            vals = np.array([metrics[u][key] for u in uids], dtype=np.float64)
+            order = np.argsort(vals)                     # ascending
+            pct = np.empty_like(vals)
+            pct[order] = np.linspace(0.0, 1.0, len(vals)) if len(vals) > 1 \
+                else np.array([0.0])
+            return pct if not reverse_good else (1.0 - pct)
+
+        r_sharp = ranks_for("sharp", reverse_good=True)   # low sharp = bad
+        r_cast = ranks_for("cast", reverse_good=False)    # high cast = bad
+        r_clip = ranks_for("clip", reverse_good=False)
+        r_block = ranks_for("block", reverse_good=False)
+        combined = np.maximum(np.maximum(r_sharp, r_cast), np.maximum(r_clip, r_block))
+        return {u: float(combined[i]) for i, u in enumerate(uids)}
+
+
         """Greedy nearest-neighbor chain seeded by the largest-Mp image, so
         similar images sit next to each other (clusters = runs of neighbors)."""
         if not items:
@@ -820,6 +934,10 @@ class CropApp:
             else FILE_SORT_NAME
         if mode == FILE_SORT_SIM and HAS_NUMPY:
             active = self._similarity_order(active)
+        elif mode == FILE_SORT_QUAL and HAS_NUMPY:
+            ranks = self._quality_badness_ranks(active)
+            active.sort(key=lambda it: (-ranks.get(it.uid, 0.0),
+                                        it.src_name.lower(), it.uid))
         else:
             active.sort(key=self._file_sort_key())
         excluded.sort(key=lambda it: (it.src_name.lower(), it.uid))
@@ -828,10 +946,11 @@ class CropApp:
     def _sort_items(self):
         if not self.items:
             return
-        if self.file_sort_var.get() == FILE_SORT_SIM and not HAS_NUMPY:
+        mode = self.file_sort_var.get()
+        if mode in (FILE_SORT_SIM, FILE_SORT_QUAL) and not HAS_NUMPY:
             messagebox.showinfo(
-                "Similarity sort",
-                "Similarity sorting needs numpy.\n\npip install numpy")
+                "Sort needs numpy",
+                f"'{mode}' needs numpy.\n\npip install numpy")
             self.file_sort_var.set(FILE_SORT_NAME)
             return
         cur_uid = self.items[self.cur_idx].uid \
@@ -954,6 +1073,21 @@ class CropApp:
                 return
             i += step
         self._set_status("No further images with crops in that direction.")
+
+    def _nav_without_crops(self, step):
+        """Jump to the next image (in the given direction) that has NO boxes
+        yet -- for finding what still needs work. Skips trashed images, since
+        those aren't meant to be acted on."""
+        if not self.items:
+            return
+        i = self.cur_idx + step
+        while 0 <= i < len(self.items):
+            it = self.items[i]
+            if not it.boxes and not it.excluded:
+                self._go_to(it)
+                return
+            i += step
+        self._set_status("No further images without crops in that direction.")
 
     def _on_tree_wheel(self, e):
         self.tree.yview_scroll(-1 if e.delta > 0 else 1, "units")
@@ -1092,6 +1226,183 @@ class CropApp:
 
         bs_entry.bind("<Return>", lambda e: refresh())
         ttk.Button(top, text="Refresh", command=refresh).pack(side=tk.LEFT, padx=4)
+        refresh()
+
+    # ------------------------------------------------------- quality report -
+
+    def _open_quality_report(self):
+        if not self.items:
+            return
+        if not HAS_NUMPY:
+            messagebox.showinfo("Quality report",
+                                "Quality metrics need numpy.\n\npip install numpy")
+            return
+        active = [it for it in self.items if not it.excluded]
+        if not active:
+            messagebox.showinfo("Quality report", "No non-excluded images to scan.")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Quality report")
+        win.geometry("900x640")
+
+        top = ttk.Frame(win, padding=6)
+        top.pack(fill=tk.X)
+        ttk.Label(top, text="Flag worst").pack(side=tk.LEFT)
+        pct_var = tk.StringVar(value="10")
+        ttk.Entry(top, width=4, textvariable=pct_var).pack(side=tk.LEFT, padx=4)
+        ttk.Label(top, text="% by any one metric (red rows)").pack(side=tk.LEFT)
+        summary = ttk.Label(top, text="", font=("Consolas", 9))
+        summary.pack(side=tk.LEFT, padx=12)
+
+        wrap = ttk.Frame(win, padding=(6, 0, 6, 6))
+        wrap.pack(fill=tk.BOTH, expand=True)
+        cols = ("sharp", "cast", "clip", "block")
+        tree = ttk.Treeview(wrap, columns=cols, selectmode="extended")
+        tree.heading("#0", text="File")
+        heads = {"sharp": "Sharpness \u25b2good", "cast": "Color cast \u25bcgood",
+                 "clip": "Clipping% \u25bcgood", "block": "Blockiness \u25bcgood"}
+        for c in cols:
+            tree.heading(c, text=heads[c],
+                        command=lambda c=c: sort_by(c))
+            tree.column(c, width=130, anchor=tk.CENTER)
+        tree.column("#0", width=280)
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree.tag_configure("bad", foreground="#c00000")
+        tree.tag_configure("trashed", foreground="#999999")
+
+        def open_in_main(_event=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            uid = int(sel[0])
+            for it in self.items:
+                if it.uid == uid:
+                    self._go_to(it)
+                    self.root.lift()
+                    self.root.focus_force()
+                    break
+
+        tree.bind("<Double-1>", open_in_main)
+
+        state = {"sort_col": None, "sort_rev": False, "rows": []}
+
+        def compute():
+            metrics = {it.uid: self._quality_metrics(it.src_name) for it in active}
+            ranks = self._quality_badness_ranks(active)
+            try:
+                pct = max(0.0, min(100.0, float(pct_var.get()))) / 100.0
+            except ValueError:
+                pct = 0.10
+            cutoff = 1.0 - pct
+            rows = []
+            for it in active:
+                m = metrics[it.uid]
+                bad = ranks.get(it.uid, 0.0) >= cutoff
+                rows.append((it, m, bad))
+            state["rows"] = rows
+            return rows
+
+        def sort_by(col):
+            worst_is_high = col != "sharp"   # sharp: worst = lowest value
+            if state["sort_col"] == col:
+                state["sort_rev"] = not state["sort_rev"]
+            else:
+                state["sort_col"] = col
+                state["sort_rev"] = worst_is_high   # first click: worst first
+            render()
+
+        def render():
+            rows = state["rows"]
+            col = state["sort_col"]
+            if col:
+                rows = sorted(rows, key=lambda r: r[1][col], reverse=state["sort_rev"])
+            tree.delete(*tree.get_children())
+            for it, m, bad in rows:
+                if it.excluded:
+                    tag, prefix = "trashed", "\u2717 "
+                elif bad:
+                    tag, prefix = "bad", ""
+                else:
+                    tag, prefix = "", ""
+                tree.insert("", tk.END, iid=str(it.uid),
+                            text=prefix + os.path.basename(it.src_name),
+                            image=self._thumb(it.src_name),
+                            values=(f"{m['sharp']:.0f}", f"{m['cast']:.1f}",
+                                    f"{m['clip']:.1f}", f"{m['block']:.2f}"),
+                            tags=(tag,) if tag else ())
+            n_bad = sum(1 for _, _, b in rows if b)
+            n_trash = sum(1 for it, _m, _b in rows if it.excluded)
+            summary.configure(
+                text=f"{len(rows)} images  |  {n_bad} flagged  |  "
+                     f"{n_trash} in trash  |  click a header to sort")
+
+        def refresh():
+            compute()
+            render()
+
+        def exclude_flagged():
+            rows = state["rows"]
+            targets = [it for it, _m, bad in rows if bad]
+            if not targets:
+                messagebox.showinfo("Quality report", "No flagged images.")
+                return
+            if not messagebox.askyesno(
+                    "Exclude flagged",
+                    f"Mark {len(targets)} flagged image(s) as excluded?\n"
+                    f"They'll sink to the bottom of the file list."):
+                return
+            uids = {it.uid for it in targets}
+            for it in self.items:
+                if it.uid in uids:
+                    it.excluded = True
+            active_now = [i for i in self.items if not i.excluded]
+            excl_now = [i for i in self.items if i.excluded]
+            self.items = active_now + excl_now
+            self._pending_resort = False
+            self._populate_tree()
+            self._save_session()
+            self._set_status(f"Excluded {len(targets)} flagged image(s).")
+            refresh()
+
+        def toggle_selected(_event=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            uids = {int(i) for i in sel}
+            for it in self.items:
+                if it.uid in uids:
+                    it.excluded = not it.excluded
+            active_now = [i for i in self.items if not i.excluded]
+            excl_now = [i for i in self.items if i.excluded]
+            self.items = active_now + excl_now
+            self._pending_resort = False
+            self._populate_tree()
+            self._save_session()
+            refresh()
+
+        ttk.Button(top, text="Refresh", command=refresh).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="Exclude flagged (red)",
+                   command=exclude_flagged).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(top, text="Toggle trash on selected (Ctrl+T)",
+                   command=toggle_selected).pack(side=tk.RIGHT, padx=2)
+        # Ctrl+T is bound on root for the main view, but this report is a
+        # separate Toplevel and won't see it unless bound here too
+        win.bind("<Control-t>", toggle_selected)
+
+        note = ttk.Label(
+            win, wraplength=740, justify=tk.LEFT, padding=(6, 0, 6, 6),
+            text="Double-click a row to open it in the main view. Heuristics, "
+                 "not ground truth: sharpness is content-dependent (a flat "
+                 "sky reads 'blurry' even in focus); color cast flags any "
+                 "non-neutral tint, including legitimate warm/cool scenes; "
+                 "clipping/blockiness are the more reliable signals. Use this "
+                 "to prioritize review, not as an automatic verdict.")
+        note.pack(side=tk.BOTTOM, fill=tk.X)
+
         refresh()
 
     def _refresh_fit_options(self):
@@ -1564,7 +1875,11 @@ class CropApp:
         return mx + 1
 
     def _export_item(self, item) -> int:
-        """Export all un-exported boxes on one item. Returns count written."""
+        """Export all un-exported boxes on one item. Returns count written.
+        Excluded (trashed) items are skipped entirely -- their boxes are left
+        exactly as-is, untouched, until the item is un-excluded."""
+        if item.excluded:
+            return 0
         pending = [b for b in item.boxes if not b.exported]
         if not pending:
             return 0
@@ -1594,6 +1909,15 @@ class CropApp:
         if not self.items:
             return
         item = self.items[self.cur_idx]
+        if item.excluded:
+            pending = sum(1 for b in item.boxes if not b.exported)
+            if pending:
+                self._set_status(
+                    f"'{os.path.basename(item.src_name)}' is in the trash bin "
+                    f"({pending} box(es) held). Ctrl+T to un-exclude before cropping.")
+            else:
+                self._set_status("This image is in the trash bin.")
+            return
         n = self._export_item(item)
         if n == 0:
             self._set_status("No unexported boxes on this image.")
@@ -1607,18 +1931,28 @@ class CropApp:
             return
         total = 0
         imgs = 0
+        held = 0
         for item in self.items:
+            if item.excluded:
+                if any(not b.exported for b in item.boxes):
+                    held += 1
+                continue
             n = self._export_item(item)
             if n:
                 total += n
                 imgs += 1
         if total == 0:
-            self._set_status("No unexported boxes anywhere.")
+            msg = "No unexported boxes anywhere."
+            if held:
+                msg += f" ({held} image(s) with boxes held in the trash bin.)"
+            self._set_status(msg)
             return
         self._save_session()
         self._redraw()
-        self._set_status(
-            f"Exported {total} crop(s) across {imgs} image(s) to {self.out_root}")
+        msg = f"Exported {total} crop(s) across {imgs} image(s) to {self.out_root}"
+        if held:
+            msg += f"  |  {held} trashed image(s) skipped, boxes held"
+        self._set_status(msg)
 
     # ------------------------------------------------------------- misc -----
 
