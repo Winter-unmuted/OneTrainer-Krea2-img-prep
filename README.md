@@ -36,7 +36,7 @@ OneTrainer sorts images into aspect-ratio buckets and scales/crops each one to f
 
 **Quality report.** Four measured signals per image, not an LLM guessing: sharpness (blur), color cast, clipping, JPEG blockiness. Sortable table with thumbnails, worst-percentile rows flagged red, batch-exclude the flagged ones, double-click a row to jump straight to that image. Also usable as a file-list sort mode (worst-first).
 
-![quality report](docs/quality.png)
+<img width="1346" height="1001" alt="image" src="https://github.com/user-attachments/assets/9f3392be-bd85-4af0-955d-12906ec2b7aa" />
 
 Plus: dark mode, Open folder / Reload without restarting, optional recursive subfolder scan, sortable file list (name / megapixels / crop count / similarity / quality), Crop All, per-session save/resume, no-upscale hard rule.
 
