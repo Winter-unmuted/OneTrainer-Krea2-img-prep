@@ -542,6 +542,10 @@ class CropApp:
                              values=FILE_SORT_MODES, width=22, state="readonly")
         fsort.pack(side=tk.LEFT, padx=4)
         fsort.bind("<<ComboboxSelected>>", lambda e: self._sort_items())
+        self.sort_reverse_var = tk.BooleanVar(value=False)
+        self.sort_dir_btn = ttk.Button(sort_row, text="\u25b2", width=3,
+                                       command=self._toggle_sort_direction)
+        self.sort_dir_btn.pack(side=tk.LEFT)
 
         # buttons reserved at the bottom FIRST so they can't be clipped off
         btns = ttk.Frame(right)
@@ -605,6 +609,12 @@ class CropApp:
         self.root.bind("<Alt-Down>", lambda e: self._nav_without_crops(+1))
         self.root.bind("<Control-Left>", lambda e: self._snap_step(-1))
         self.root.bind("<Control-Right>", lambda e: self._snap_step(+1))
+        self.root.bind("<Alt-Left>", lambda e: self._percent_step(-1, 1))
+        self.root.bind("<Alt-Right>", lambda e: self._percent_step(+1, 1))
+        self.root.bind("<Alt-Shift-Left>", lambda e: self._percent_step(-1, 5))
+        self.root.bind("<Alt-Shift-Right>", lambda e: self._percent_step(+1, 5))
+        self.root.bind("<Control-Alt-Left>", lambda e: self._low_noise_step(-1))
+        self.root.bind("<Control-Alt-Right>", lambda e: self._low_noise_step(+1))
         self.root.bind("<Control-t>", lambda e: self._toggle_exclude_current())
         for key, dx, dy in (("<Left>", -1, 0), ("<Right>", 1, 0),
                             ("<Up>", 0, -1), ("<Down>", 0, 1)):
@@ -904,7 +914,7 @@ class CropApp:
         combined = np.maximum(np.maximum(r_sharp, r_cast), np.maximum(r_clip, r_block))
         return {u: float(combined[i]) for i, u in enumerate(uids)}
 
-
+    def _similarity_order(self, items):
         """Greedy nearest-neighbor chain seeded by the largest-Mp image, so
         similar images sit next to each other (clusters = runs of neighbors)."""
         if not items:
@@ -926,8 +936,9 @@ class CropApp:
         return order
 
     def _ordered_items(self):
-        """Full display order: active images sorted by the chosen mode, then
-        excluded images (always) at the bottom in name order."""
+        """Full display order: active images sorted by the chosen mode
+        (reversed if the direction toggle is on), then excluded images
+        (always) at the bottom in name order."""
         excluded = [it for it in self.items if getattr(it, "excluded", False)]
         active = [it for it in self.items if not getattr(it, "excluded", False)]
         mode = self.file_sort_var.get() if hasattr(self, "file_sort_var") \
@@ -940,8 +951,16 @@ class CropApp:
                                         it.src_name.lower(), it.uid))
         else:
             active.sort(key=self._file_sort_key())
+        if getattr(self, "sort_reverse_var", None) and self.sort_reverse_var.get():
+            active.reverse()
         excluded.sort(key=lambda it: (it.src_name.lower(), it.uid))
         return active + excluded
+
+    def _toggle_sort_direction(self):
+        self.sort_reverse_var.set(not self.sort_reverse_var.get())
+        self.sort_dir_btn.configure(
+            text="\u25bc" if self.sort_reverse_var.get() else "\u25b2")
+        self._sort_items()
 
     def _sort_items(self):
         if not self.items:
@@ -966,6 +985,7 @@ class CropApp:
         if self.items:
             uid = str(self.items[self.cur_idx].uid)
             self.tree.selection_set(uid)
+            self.tree.update_idletasks()
             self.tree.see(uid)
 
     def _toggle_exclude_current(self):
@@ -1051,9 +1071,10 @@ class CropApp:
 
         if not from_tree:
             self.tree.selection_set(str(item.uid))
+            self.tree.update_idletasks()   # force layout so see() scrolls correctly
             self.tree.see(str(item.uid))
 
-        self._refresh_fit_options()
+        self._refresh_fit_options(new_image=True)
         self._redraw(full=True)
 
     def _nav(self, step):
@@ -1405,14 +1426,35 @@ class CropApp:
 
         refresh()
 
-    def _refresh_fit_options(self):
+    def _best_aspect_match_idx(self, img_ar, fit_options):
+        """Index into fit_options for the default crop-size pick. Restricts
+        to the LARGEST target family that has any fitting option at all --
+        erring on higher resolution over a perfect aspect match, per user
+        preference -- then within that family picks the closest aspect
+        match to img_ar."""
+        if not fit_options:
+            return 0
+        max_t = max(t for (_w, _h, t) in fit_options)
+        candidates = [i for i, (_w, _h, t) in enumerate(fit_options) if t == max_t]
+
+        def rank(i):
+            bw, bh, _t = fit_options[i]
+            diff = abs((bw / bh) - img_ar)
+            return (diff, -(bw * bh))
+
+        return min(candidates, key=rank)
+
+    def _refresh_fit_options(self, new_image=False):
         item = self.items[self.cur_idx]
         ww, wh = self._working_dims(item)
         self.work_dims = (ww, wh)
 
         # remember currently selected (w,h) so we can keep it across re-sorts
+        # of THIS SAME image (size-list sort mode change, downscale, etc).
+        # Landing on a brand new image ignores this and picks fresh below.
         prev = None
-        if self.fit_options and 0 <= self.sel_size_idx < len(self.fit_options):
+        if not new_image and self.fit_options \
+                and 0 <= self.sel_size_idx < len(self.fit_options):
             prev = self.fit_options[self.sel_size_idx][:2]
 
         fit = [b for b in self.buckets if b[0] <= ww and b[1] <= wh]
@@ -1443,14 +1485,17 @@ class CropApp:
             self.opt_to_row[opt_idx] = row
             row += 1
 
-        # restore or clamp selection
+        # restore or pick a fresh best match (never index-0-of-arbitrary-order)
         if self.fit_options:
-            new_idx = 0
+            new_idx = None
             if prev is not None:
                 for i, (bw, bh, _t) in enumerate(self.fit_options):
                     if (bw, bh) == prev:
                         new_idx = i
                         break
+            if new_idx is None:
+                img_ar = (ww / wh) if wh else 1.0
+                new_idx = self._best_aspect_match_idx(img_ar, self.fit_options)
             self.sel_size_idx = new_idx
             self._sync_size_selection()
         else:
@@ -1602,6 +1647,91 @@ class CropApp:
             self.snap_label.configure(
                 text=f"best: {nearest['w']}x{nearest['h']} @ x{nearest['scale']:.3f}",
                 foreground="#888888")
+
+    # -- percent-grid + low-noise zoom stepping (Alt / Alt+Shift / Ctrl+Alt) --
+
+    def _percent_step(self, direction, grid):
+        """Step scale to the next grid-aligned whole percent in `direction`
+        (grid=1 for Alt+Left/Right, grid=5 for Alt+Shift+Left/Right). Always
+        moves at least one grid step, even if already grid-aligned."""
+        item = self.items[self.cur_idx]
+        if item.locked or item.boxes:
+            self._on_slider_press(None)
+            return
+        mn_pct = self._min_scale(item) * 100.0
+        cur_pct = item.scale * 100.0
+        eps = 1e-4
+        if direction < 0:
+            new_pct = math.floor((cur_pct - eps) / grid) * grid
+        else:
+            new_pct = math.ceil((cur_pct + eps) / grid) * grid
+        clamped = max(mn_pct, min(100.0, new_pct))
+        item.scale = clamped / 100.0
+        self.scale_var.set(clamped)
+        self._set_scale_entry(item.scale)
+        self._scale_commit()
+        note = ""
+        if clamped != new_pct:
+            note = "  (clamped at limit)"
+        self._set_status(f"Scale: {clamped:.0f}%{note}")
+
+    def _low_noise_candidates(self, item):
+        """Scales where BOTH working dimensions land close to whole pixels.
+        score(scale) = combined fractional misalignment of width and height;
+        lower means the resize kernel samples closer to original pixel
+        centers, so less ringing/moire -- a genuine per-image 'least
+        resampling artifact' set, not a fixed list of 'nice' fractions.
+        Candidates are the local minima of that score over the achievable
+        scale range."""
+        ow, oh = self._oriented_size(item)
+        mn = self._min_scale(item)
+        if not HAS_NUMPY or mn >= 1.0 - 1e-9:
+            return [1.0]
+        n = 4000
+        scales = np.linspace(mn, 1.0, n)
+        fw = ow * scales
+        fh = oh * scales
+
+        def frac_dist(x):
+            f = x - np.floor(x)
+            return np.minimum(f, 1.0 - f)
+
+        score = frac_dist(fw) + frac_dist(fh)
+        is_min = np.zeros(n, dtype=bool)
+        is_min[1:-1] = (score[1:-1] <= score[:-2]) & (score[1:-1] <= score[2:])
+        is_min[0] = score[0] <= score[1]
+        is_min[-1] = True   # always keep 100% reachable as a candidate
+        cand = sorted(set(round(float(s), 4) for s in scales[is_min]))
+        # merge near-duplicate candidates (within 0.2%)
+        merged = []
+        for c in cand:
+            if merged and c - merged[-1] < 0.002:
+                continue
+            merged.append(c)
+        return merged or [1.0]
+
+    def _low_noise_step(self, direction):
+        item = self.items[self.cur_idx]
+        if item.locked or item.boxes:
+            self._on_slider_press(None)
+            return
+        cands = self._low_noise_candidates(item)
+        if not cands:
+            return
+        cur = item.scale
+        if direction < 0:
+            picks = [c for c in cands if c < cur - 1e-4]
+            new = picks[-1] if picks else cands[0]
+        else:
+            picks = [c for c in cands if c > cur + 1e-4]
+            new = picks[0] if picks else cands[-1]
+        item.scale = new
+        self.scale_var.set(new * 100.0)
+        self._set_scale_entry(new)
+        self._scale_commit()
+        self._set_status(
+            f"Low-noise scale: x{new:.4f} ({new * 100:.2f}%) -- width/height "
+            f"land close to whole pixels here, minimizing resampling artifacts.")
 
     # -- freeform scaling -----------------------------------------------------
 

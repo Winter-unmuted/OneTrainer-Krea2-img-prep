@@ -10,7 +10,7 @@ OneTrainer sorts images into aspect-ratio buckets and scales/crops each one to f
 
 ## What it does
 
-**Place exact-size crop boxes.** Wheel to cycle bucket sizes, click to drop a box. The box is a real bucket resolution (e.g. 896x1152), cut verbatim, no resampling.
+**Place exact-size crop boxes.** Wheel to cycle bucket sizes, click to drop a box. The box is a real bucket resolution (e.g. 896x1152), cut verbatim, no resampling. Landing on a new image auto-picks the largest bucket family that fits, best-matched to its aspect ratio.
 
 <img width="2248" height="1394" alt="image" src="https://github.com/user-attachments/assets/d853e83b-8654-4e0f-a895-58f78d001b2b" />
 
@@ -30,7 +30,7 @@ OneTrainer sorts images into aspect-ratio buckets and scales/crops each one to f
 
 <img width="837" height="1001" alt="image" src="https://github.com/user-attachments/assets/0bd0b83f-5eef-442d-8505-8be7521bebd2" />
 
-**Similarity sort + exclude.** Sort the file list by color-histogram similarity (size- and crop-tolerant), seeded from the biggest image so clusters fall next to each other. Mark junk/dupes as excluded (Ctrl+T) and they drop to the bottom of every sort. Excluded images hold their crop boxes untouched and are skipped by Crop / Crop All until you un-exclude them.
+**Similarity sort + exclude.** Sort the file list by color-histogram similarity (size- and crop-tolerant), seeded from the biggest image so clusters fall next to each other. Mark junk/dupes as excluded (Ctrl+T) and they drop to the bottom of every sort. Excluded images hold their crop boxes untouched and are skipped by Crop / Crop All until you un-exclude them. Any sort mode can also run ascending or descending (▲/▼ button next to the dropdown).
 
 <img width="714" height="751" alt="image" src="https://github.com/user-attachments/assets/d8c9f6bb-6f87-4f44-b717-d76e24e82434" />
 
@@ -38,7 +38,7 @@ OneTrainer sorts images into aspect-ratio buckets and scales/crops each one to f
 
 <img width="1346" height="1001" alt="image" src="https://github.com/user-attachments/assets/9f3392be-bd85-4af0-955d-12906ec2b7aa" />
 
-Plus: dark mode, Open folder / Reload without restarting, optional recursive subfolder scan, sortable file list (name / megapixels / crop count / similarity / quality), Crop All, per-session save/resume, no-upscale hard rule.
+Plus: dark mode, Open folder / Reload without restarting, optional recursive subfolder scan, sortable file list (name / megapixels / crop count / similarity / quality, each ascending or descending), Crop All, per-session save/resume, no-upscale hard rule.
 
 ## Hotkeys
 
@@ -54,6 +54,9 @@ Plus: dark mode, Open folder / Reload without restarting, optional recursive sub
 | C or Ctrl+E | crop this image |
 | Ctrl+D | clone + downscale |
 | Ctrl+← / → | step to prev / next best-fit bucket |
+| Alt+← / → | zoom to nearest whole percent |
+| Alt+Shift+← / → | zoom to nearest 5% |
+| Ctrl+Alt+← / → | zoom to nearest low-artifact scale |
 | Ctrl+↑ / ↓ | jump to prev / next image with crops |
 | Alt+↑ / ↓ | jump to prev / next image without crops |
 | Ctrl+T | exclude / include (trash) — also works in the Quality report |
@@ -79,7 +82,7 @@ Note that each concept size is the total number of pixels, so multiple aspect ra
 
 ```
 pip install pillow numpy
-python krea2_crop_tool.py
+python Onetrainer_crop_prep.py
 ```
 
 Pick your resolutions (e.g. `512, 768, 1024`) and a folder. Crops land in `<folder>/crops/`.
