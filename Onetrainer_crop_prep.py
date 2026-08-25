@@ -29,6 +29,29 @@ Hotkeys:
   C  or  Ctrl+E ....... export (crop) current image's boxes
   Ctrl+D .............. clone current image for downscaling
   Escape .............. deselect box
+  F1 .................. show full hotkey help window
+  Ctrl/Shift/Ctrl+Shift-click in the image list ... multi-select images
+
+Optional sort mode "Face inclusion" (image list) ranks images by how much
+of a face is captured in-frame, using OpenCV's YuNet face detector
+(cv2.FaceDetectorYN). Needs numpy, opencv-python, AND the model file
+face_detection_yunet_2023mar.onnx sitting next to this script (repo root).
+
+GitHub's raw.githubusercontent.com link for that file returns a Git-LFS
+pointer stub, not the actual weights, so a plain curl/wget from there will
+NOT work. To get the real file (~233 KB, SHA256
+8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4):
+  - pip install huggingface_hub, then:
+    python -c "from huggingface_hub import hf_hub_download as d; \
+      print(d('opencv/face_detection_yunet', \
+               'face_detection_yunet_2023mar.onnx'))"
+    then move the printed path's file next to this script.
+  - or open the file's GitHub page in a browser and use its "Download raw
+    file" button (browsers resolve the LFS redirect; curl/wget don't):
+    https://github.com/opencv/opencv_zoo/blob/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+Without the model file, "Face inclusion" sorting is simply unavailable
+(falls back to Name sort with a message); everything else in the tool
+works fine.
 """
 
 import json
@@ -37,6 +60,9 @@ import os
 import re
 import sys
 import colorsys
+import hashlib
+import threading
+import urllib.request
 import tkinter as tk
 
 try:
@@ -44,6 +70,11 @@ try:
     HAS_NUMPY = True
 except ImportError:
     HAS_NUMPY = False
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from PIL import Image, ImageOps, ImageTk
@@ -117,8 +148,45 @@ FILE_SORT_MP = "Megapixels (high\u2192low)"
 FILE_SORT_CROPS = "Crop boxes (most\u2192few)"
 FILE_SORT_SIM = "Similarity (clustered)"
 FILE_SORT_QUAL = "Quality (worst first)"
+FILE_SORT_FACE = "Face inclusion (full\u2192none)"
 FILE_SORT_MODES = [FILE_SORT_NAME, FILE_SORT_MP, FILE_SORT_CROPS, FILE_SORT_SIM,
-                   FILE_SORT_QUAL]
+                   FILE_SORT_QUAL, FILE_SORT_FACE]
+
+# Lazily-loaded YuNet face detector (shared across all images; loaded once).
+# Model file must sit next to this script -- see module docstring for where
+# to get it (GitHub's raw link only serves a Git-LFS pointer stub, not the
+# real weights).
+YUNET_MODEL_FILENAME = "face_detection_yunet_2023mar.onnx"
+YUNET_MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), YUNET_MODEL_FILENAME)
+# Hugging Face's standard resolve-URL (redirects to the real CDN bytes,
+# unlike GitHub's raw link which serves a Git-LFS pointer stub for this
+# file). Verified against the file's published SHA256 after download.
+YUNET_MODEL_URL = ("https://huggingface.co/opencv/face_detection_yunet/"
+                   "resolve/main/face_detection_yunet_2023mar.onnx")
+YUNET_MODEL_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
+
+_YUNET_DETECTOR = None
+_YUNET_LOAD_FAILED = False
+
+
+def _get_yunet_detector():
+    """Return the shared YuNet detector, or None if unavailable (missing
+    cv2, missing model file, or the model failed to load)."""
+    global _YUNET_DETECTOR, _YUNET_LOAD_FAILED
+    if _YUNET_DETECTOR is not None or _YUNET_LOAD_FAILED or not HAS_CV2:
+        return _YUNET_DETECTOR
+    if not os.path.isfile(YUNET_MODEL_PATH):
+        _YUNET_LOAD_FAILED = True
+        return None
+    try:
+        _YUNET_DETECTOR = cv2.FaceDetectorYN.create(
+            YUNET_MODEL_PATH, "", (320, 320),
+            score_threshold=0.6, nms_threshold=0.3, top_k=5000)
+    except Exception:
+        _YUNET_LOAD_FAILED = True
+        return None
+    return _YUNET_DETECTOR
 
 
 def sort_buckets(buckets: list[tuple[int, int, int]], mode: str
@@ -259,6 +327,7 @@ class CropApp:
         self.dim_cache = {}
         self._feat_cache = {}
         self._qual_cache = {}
+        self._face_cache = {}
         self.selected_box = None
         self.ghost_xy = None
         self.sel_size_idx = 0
@@ -427,6 +496,11 @@ class CropApp:
                         command=self._toggle_subdirs).pack(side=tk.LEFT, padx=8)
         ttk.Button(top0, text="Toggle dark mode",
                    command=self._toggle_dark).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top0, text="Help (F1)",
+                   command=self._show_help).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top0, text="Download face model\u2026",
+                   command=lambda: self._download_yunet_model()
+                   ).pack(side=tk.LEFT, padx=4)
         ttk.Label(top0, text="Output subdir:").pack(side=tk.LEFT, padx=(12, 2))
         self.outname_var = tk.StringVar(value=OUTPUT_DIRNAME)
         self.outname_entry = ttk.Entry(top0, width=16,
@@ -507,7 +581,7 @@ class CropApp:
                  "Ctrl+D: clone | \u25c0\u25b6 by slider: snap to best-fit bucket | "
                  "Ctrl+\u2191/\u2193: jump to next image with crops | "
                  "Alt+\u2191/\u2193: jump to next image without crops | "
-                 "Ctrl+T: exclude | Esc: deselect")
+                 "Ctrl+T: exclude | Esc: deselect | F1: help")
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
 
         # ---- main panes ----
@@ -532,7 +606,8 @@ class CropApp:
         right = ttk.Frame(main, padding=4)
         right.pack(side=tk.RIGHT, fill=tk.Y)
         ttk.Label(right, text="Images  (Ctrl+\u2191/\u2193: with crops, "
-                              "Alt+\u2191/\u2193: without crops)"
+                              "Alt+\u2191/\u2193: without crops)\n"
+                              "Ctrl/Shift/Ctrl+Shift-click to multi-select"
                   ).pack(side=tk.TOP, anchor=tk.W)
         sort_row = ttk.Frame(right)
         sort_row.pack(side=tk.TOP, fill=tk.X, pady=(2, 2))
@@ -564,7 +639,7 @@ class CropApp:
         tree_wrap = ttk.Frame(right)
         tree_wrap.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self.tree = ttk.Treeview(tree_wrap, columns=("mp", "crops"),
-                                 selectmode="browse", height=10)
+                                 selectmode="extended", height=10)
         self.tree.heading("#0", text="File")
         self.tree.heading("mp", text="Mp")
         self.tree.heading("crops", text="Crops")
@@ -579,6 +654,10 @@ class CropApp:
         self.tree.bind("<MouseWheel>", self._on_tree_wheel)
         self.tree.bind("<Button-4>", lambda e: self.tree.yview_scroll(-1, "units"))
         self.tree.bind("<Button-5>", lambda e: self.tree.yview_scroll(1, "units"))
+        # extended selectmode gives native Ctrl+click / Shift+click; add the
+        # Windows "hybrid" Ctrl+Shift+click (extend range, keep prior picks)
+        self.tree.bind("<Button-1>", self._on_tree_click, add="+")
+        self.tree.bind("<Control-Shift-Button-1>", self._on_tree_ctrl_shift_click)
         self.tree.tag_configure("excluded", foreground="#999999")
 
         # center: canvas
@@ -616,6 +695,7 @@ class CropApp:
         self.root.bind("<Control-Alt-Left>", lambda e: self._low_noise_step(-1))
         self.root.bind("<Control-Alt-Right>", lambda e: self._low_noise_step(+1))
         self.root.bind("<Control-t>", lambda e: self._toggle_exclude_current())
+        self.root.bind("<F1>", lambda e: self._show_help())
         for key, dx, dy in (("<Left>", -1, 0), ("<Right>", 1, 0),
                             ("<Up>", 0, -1), ("<Down>", 0, 1)):
             self.root.bind(key, lambda e, dx=dx, dy=dy: self._nudge(dx, dy, 1))
@@ -914,6 +994,77 @@ class CropApp:
         combined = np.maximum(np.maximum(r_sharp, r_cast), np.maximum(r_clip, r_block))
         return {u: float(combined[i]) for i, u in enumerate(uids)}
 
+    def _face_metrics(self, src_name):
+        """Face detection on the ORIGINAL image via OpenCV's YuNet
+        (cv2.FaceDetectorYN) -- a small CNN, not a Haar-cascade heuristic.
+        Needs the model file at YUNET_MODEL_PATH (see module docstring for
+        where to get it). Two numbers per image:
+
+        included  = estimated fraction (0-1) of a face's expected extent
+                    captured within the frame. 0 = no face found. Starts
+                    from the network's own detection confidence (which
+                    already reflects how complete/face-like the match
+                    is), then reduced if the box touches an image edge
+                    (likely cropped off-frame), and reduced again if the
+                    two eye landmarks sit close together relative to the
+                    box width -- a sign of a turned/profile face rather
+                    than a frontal one.
+        area_frac = detected face box area / total image area -- how
+                    "zoomed in" on the face the shot is. Only meaningful
+                    when included > 0.
+
+        Still a heuristic, not a measured completeness percentage --
+        treat 'included' as a ranking signal. Cached per source file."""
+        m = self._face_cache.get(src_name)
+        if m is not None:
+            return m
+        detector = _get_yunet_detector()
+        if detector is None or not HAS_NUMPY:
+            m = {"included": 0.0, "area_frac": 0.0}
+            self._face_cache[src_name] = m
+            return m
+        try:
+            orig = self._get_original(src_name)
+            w, h = orig.size
+            long_side = max(w, h)
+            scale = min(1.0, 900 / long_side) if long_side else 1.0
+            ww, hh = max(1, round(w * scale)), max(1, round(h * scale))
+            rgb = np.asarray(
+                orig.convert("RGB").resize((ww, hh), Image.Resampling.BILINEAR))
+            bgr = np.ascontiguousarray(rgb[:, :, ::-1])   # YuNet wants BGR
+
+            detector.setInputSize((ww, hh))
+            _retval, faces = detector.detect(bgr)
+            if faces is None or len(faces) == 0:
+                m = {"included": 0.0, "area_frac": 0.0}
+                self._face_cache[src_name] = m
+                return m
+
+            best = max(faces, key=lambda f: f[2] * f[3])
+            fx, fy, fw, fh, score = (float(best[0]), float(best[1]),
+                                     float(best[2]), float(best[3]),
+                                     float(best[14]))
+            area_frac = (fw * fh) / float(ww * hh)
+
+            # landmarks: [4,5]=right eye, [6,7]=left eye, ... (x, y pairs)
+            eye_sep = abs(float(best[6]) - float(best[4]))
+            frontal_ratio = eye_sep / fw if fw > 0 else 0.0
+
+            touches_edge = (fx <= 1 or fy <= 1
+                            or fx + fw >= ww - 1 or fy + fh >= hh - 1)
+
+            included = max(0.0, min(1.0, score))
+            if frontal_ratio < 0.22:      # eyes bunched -> turned/profile
+                included *= 0.7
+            if touches_edge:
+                included *= 0.6
+
+            m = {"included": included, "area_frac": area_frac}
+        except Exception:
+            m = {"included": 0.0, "area_frac": 0.0}
+        self._face_cache[src_name] = m
+        return m
+
     def _similarity_order(self, items):
         """Greedy nearest-neighbor chain seeded by the largest-Mp image, so
         similar images sit next to each other (clusters = runs of neighbors)."""
@@ -949,6 +1100,11 @@ class CropApp:
             ranks = self._quality_badness_ranks(active)
             active.sort(key=lambda it: (-ranks.get(it.uid, 0.0),
                                         it.src_name.lower(), it.uid))
+        elif mode == FILE_SORT_FACE and HAS_CV2 and HAS_NUMPY:
+            metrics = {it.uid: self._face_metrics(it.src_name) for it in active}
+            active.sort(key=lambda it: (-metrics[it.uid]["included"],
+                                        -metrics[it.uid]["area_frac"],
+                                        it.src_name.lower(), it.uid))
         else:
             active.sort(key=self._file_sort_key())
         if getattr(self, "sort_reverse_var", None) and self.sort_reverse_var.get():
@@ -966,11 +1122,28 @@ class CropApp:
         if not self.items:
             return
         mode = self.file_sort_var.get()
-        if mode in (FILE_SORT_SIM, FILE_SORT_QUAL) and not HAS_NUMPY:
+        if mode in (FILE_SORT_SIM, FILE_SORT_QUAL, FILE_SORT_FACE) and not HAS_NUMPY:
             messagebox.showinfo(
                 "Sort needs numpy",
                 f"'{mode}' needs numpy.\n\npip install numpy")
             self.file_sort_var.set(FILE_SORT_NAME)
+            return
+        if mode == FILE_SORT_FACE and not HAS_CV2:
+            messagebox.showinfo(
+                "Sort needs OpenCV",
+                f"'{mode}' needs OpenCV.\n\npip install opencv-python")
+            self.file_sort_var.set(FILE_SORT_NAME)
+            return
+        if mode == FILE_SORT_FACE and HAS_CV2 and not os.path.isfile(YUNET_MODEL_PATH):
+            if messagebox.askyesno(
+                    "Face model not found",
+                    f"The YuNet face-detection model isn't downloaded yet."
+                    f"\n\nDownload it now (~230 KB, from huggingface.co)?"):
+                self._download_yunet_model(
+                    on_done=lambda ok: self._sort_items() if ok
+                    else self.file_sort_var.set(FILE_SORT_NAME))
+            else:
+                self.file_sort_var.set(FILE_SORT_NAME)
             return
         cur_uid = self.items[self.cur_idx].uid \
             if 0 <= self.cur_idx < len(self.items) else None
@@ -990,6 +1163,21 @@ class CropApp:
 
     def _toggle_exclude_current(self):
         if not self.items:
+            return
+        sel = self.tree.selection()
+        if len(sel) > 1:
+            uids = {int(s) for s in sel}
+            targets = [it for it in self.items if it.uid in uids]
+            # any included in the selection? exclude all. else, include all.
+            new_state = any(not it.excluded for it in targets)
+            for it in targets:
+                it.excluded = new_state
+                self._refresh_tree_row(it)
+            self._pending_resort = True
+            self._save_session()
+            self._set_status(
+                f"{'Excluded' if new_state else 'Included'} {len(targets)} "
+                f"selected image(s) (settles when you move to another image).")
             return
         item = self.items[self.cur_idx]
         item.excluded = not item.excluded
@@ -1025,12 +1213,47 @@ class CropApp:
         sel = self.tree.selection()
         if not sel:
             return
+        if len(sel) > 1:
+            self._set_status(
+                f"{len(sel)} images selected. Ctrl+T (or the Exclude/include "
+                f"button) applies to the whole selection.")
+            return
         uid = int(sel[0])
         for it in self.items:
             if it.uid == uid:
                 if it is not self.items[self.cur_idx]:
                     self._go_to(it, from_tree=True)
                 return
+
+    def _on_tree_click(self, _e):
+        """Record the clicked row as the range anchor for Ctrl+Shift+click.
+        Runs alongside (not instead of) the tree's own click handling."""
+        row = self.tree.identify_row(_e.y)
+        if row:
+            self._tree_click_anchor = row
+
+    def _on_tree_ctrl_shift_click(self, e):
+        """Windows-standard hybrid: extend the range from the last-clicked
+        row to this one, ADDING it to whatever is already selected (unlike
+        plain Shift+click, which replaces the selection with just the
+        range)."""
+        row = self.tree.identify_row(e.y)
+        if not row:
+            return "break"
+        children = self.tree.get_children("")
+        anchor = getattr(self, "_tree_click_anchor", None)
+        if anchor not in children:
+            anchor = self.tree.focus() if self.tree.focus() in children else row
+        if anchor not in children or row not in children:
+            return "break"
+        i0, i1 = children.index(anchor), children.index(row)
+        if i0 > i1:
+            i0, i1 = i1, i0
+        new_sel = set(self.tree.selection()) | set(children[i0:i1 + 1])
+        self.tree.selection_set(tuple(new_sel))
+        self.tree.focus(row)
+        self._tree_click_anchor = row
+        return "break"
 
     # ---------------------------------------------------------- selection ---
 
@@ -1248,6 +1471,161 @@ class CropApp:
         bs_entry.bind("<Return>", lambda e: refresh())
         ttk.Button(top, text="Refresh", command=refresh).pack(side=tk.LEFT, padx=4)
         refresh()
+
+    # ------------------------------------------------------- face model ----
+
+    def _download_yunet_model(self, on_done=None):
+        """Download the YuNet ONNX model to YUNET_MODEL_PATH in a background
+        thread, verify its SHA256 before saving, and refresh the detector
+        on success. Shows a small modal progress dialog. Calls on_done(ok)
+        on the Tk thread when finished, whether it succeeded or not."""
+        if os.path.isfile(YUNET_MODEL_PATH):
+            if not messagebox.askyesno(
+                    "Model already present",
+                    f"{YUNET_MODEL_FILENAME} already exists at:\n"
+                    f"{YUNET_MODEL_PATH}\n\nRe-download it anyway?"):
+                if on_done:
+                    on_done(True)
+                return
+
+        win = tk.Toplevel(self.root)
+        win.title("Downloading face model")
+        win.geometry("440x110")
+        win.transient(self.root)
+        win.grab_set()
+        win.protocol("WM_DELETE_WINDOW", lambda: None)   # block mid-download
+        ttk.Label(win, text=f"Downloading {YUNET_MODEL_FILENAME}\u2026",
+                 padding=(12, 12, 12, 4)).pack()
+        ttk.Label(win, text="(~230 KB from huggingface.co, verified by "
+                            "checksum before use)",
+                 padding=(12, 0), foreground="#888888").pack()
+
+        result = {"ok": False, "error": None}
+
+        def worker():
+            tmp_path = YUNET_MODEL_PATH + ".part"
+            try:
+                req = urllib.request.Request(
+                    YUNET_MODEL_URL, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = resp.read()
+                digest = hashlib.sha256(data).hexdigest()
+                if digest.lower() != YUNET_MODEL_SHA256.lower():
+                    result["error"] = (
+                        f"Downloaded file didn't match the expected "
+                        f"checksum (got {digest[:12]}\u2026, expected "
+                        f"{YUNET_MODEL_SHA256[:12]}\u2026). Not saving it.")
+                    return
+                with open(tmp_path, "wb") as f:
+                    f.write(data)
+                os.replace(tmp_path, YUNET_MODEL_PATH)
+                result["ok"] = True
+            except Exception as e:
+                result["error"] = str(e)
+            finally:
+                if os.path.isfile(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+
+        def poll():
+            if t.is_alive():
+                win.after(150, poll)
+                return
+            win.grab_release()
+            win.destroy()
+            global _YUNET_DETECTOR, _YUNET_LOAD_FAILED
+            if result["ok"]:
+                _YUNET_DETECTOR = None
+                _YUNET_LOAD_FAILED = False
+                self._set_status(f"Downloaded and verified {YUNET_MODEL_FILENAME}.")
+                messagebox.showinfo(
+                    "Face model ready",
+                    f"{YUNET_MODEL_FILENAME} downloaded and checksum-"
+                    f"verified. 'Face inclusion' sorting is now available.")
+            else:
+                messagebox.showerror(
+                    "Download failed",
+                    f"Could not download the face model:\n{result['error']}"
+                    f"\n\nYou can still get it manually -- see the module "
+                    f"docstring at the top of this script for instructions.")
+            if on_done:
+                on_done(result["ok"])
+
+        win.after(150, poll)
+
+    # ------------------------------------------------------------- help ----
+
+    HELP_SECTIONS = [
+        ("Canvas / boxes", [
+            ("Left-click", "place a crop box at the cursor (or deselect, "
+                           "if a box is already selected)"),
+            ("Right-click", "select / deselect the box under the cursor"),
+            ("Mouse wheel (over image)", "cycle the crop-size to place"),
+            ("Arrow keys", "nudge the selected box 1 px"),
+            ("Shift + Arrow keys", "nudge the selected box 16 px"),
+            ("Delete / Backspace", "delete the selected box"),
+            ("Escape", "deselect box"),
+        ]),
+        ("Navigation", [
+            ("PgUp / PgDn", "previous / next image"),
+            ("Ctrl+Up / Ctrl+Down", "jump to next image WITH crop boxes"),
+            ("Alt+Up / Alt+Down", "jump to next image WITHOUT crop boxes"),
+        ]),
+        ("Downscale / snap", [
+            ("Ctrl+Left / Ctrl+Right", "step to the next best-fit bucket snap"),
+            ("Alt+Left / Alt+Right", "step scale by 1% (grid-aligned)"),
+            ("Alt+Shift+Left / Right", "step scale by 5% (grid-aligned)"),
+            ("Ctrl+Alt+Left / Right", "step to next low-resampling-noise scale"),
+        ]),
+        ("Export / other", [
+            ("C  or  Ctrl+E", "export (crop) current image's boxes"),
+            ("Ctrl+D", "clone current image for downscaling"),
+            ("Ctrl+T", "exclude / include current image, or the whole "
+                      "selection if multiple images are selected below"),
+            ("F1", "this help window"),
+            ("Download face model\u2026 (button)", "fetch+verify the YuNet "
+                                                   "model needed for the "
+                                                   "'Face inclusion' sort"),
+        ]),
+        ("Image list (right panel)", [
+            ("Click", "select one image"),
+            ("Ctrl+Click", "add / remove a single image from the selection"),
+            ("Shift+Click", "select a range from the last-clicked image"),
+            ("Ctrl+Shift+Click", "add a range to the existing selection "
+                                 "(standard Windows hybrid select)"),
+        ]),
+    ]
+
+    def _show_help(self):
+        win = tk.Toplevel(self.root)
+        win.title("Krea2 Crop Tool - Help")
+        win.geometry("560x620")
+
+        wrap = ttk.Frame(win, padding=8)
+        wrap.pack(fill=tk.BOTH, expand=True)
+        text = tk.Text(wrap, wrap="word", font=("Consolas", 10),
+                       bg="#ffffff", fg="#000000", relief=tk.FLAT)
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        text.tag_configure("h", font=("Consolas", 11, "bold"),
+                           spacing_before=10, spacing_after=4)
+        text.tag_configure("key", font=("Consolas", 10, "bold"))
+        for section, rows in self.HELP_SECTIONS:
+            text.insert(tk.END, section + "\n", "h")
+            for key, desc in rows:
+                text.insert(tk.END, f"  {key:<22}", "key")
+                text.insert(tk.END, f" {desc}\n")
+        text.configure(state=tk.DISABLED)
+
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 8))
 
     # ------------------------------------------------------- quality report -
 
