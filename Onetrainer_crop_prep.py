@@ -143,14 +143,25 @@ SORT_BY_DIMS = "By max X, then max Y"
 SORT_MODES = [SORT_BY_BUCKET, SORT_BY_ASPECT, SORT_BY_DIMS]
 
 # File-list sort modes
-FILE_SORT_NAME = "Name (A\u2192Z)"
-FILE_SORT_MP = "Megapixels (high\u2192low)"
-FILE_SORT_CROPS = "Crop boxes (most\u2192few)"
-FILE_SORT_SIM = "Similarity (clustered)"
-FILE_SORT_QUAL = "Quality (worst first)"
-FILE_SORT_FACE = "Face inclusion (full\u2192none)"
+FILE_SORT_NAME = "name"
+FILE_SORT_MP = "mp"
+FILE_SORT_CROPS = "crops"
+FILE_SORT_SIM = "sim"
+FILE_SORT_QUAL = "qual"
+FILE_SORT_FACE = "face"
 FILE_SORT_MODES = [FILE_SORT_NAME, FILE_SORT_MP, FILE_SORT_CROPS, FILE_SORT_SIM,
                    FILE_SORT_QUAL, FILE_SORT_FACE]
+
+# (label when sort_reverse_var is False, label when it's True) -- shown in
+# the sort dropdown, which is regenerated whenever the direction toggles.
+SORT_MODE_LABELS = {
+    FILE_SORT_NAME:  ("Name (A\u2192Z)",               "Name (Z\u2192A)"),
+    FILE_SORT_MP:    ("Megapixels (high\u2192low)",    "Megapixels (low\u2192high)"),
+    FILE_SORT_CROPS: ("Crop boxes (most\u2192few)",     "Crop boxes (few\u2192most)"),
+    FILE_SORT_SIM:   ("Similarity (clustered)",         "Similarity (clustered, reversed)"),
+    FILE_SORT_QUAL:  ("Quality (worst\u2192best)",      "Quality (best\u2192worst)"),
+    FILE_SORT_FACE:  ("Face inclusion (full\u2192none)", "Face inclusion (none\u2192full)"),
+}
 
 # Lazily-loaded YuNet face detector (shared across all images; loaded once).
 # Model file must sit next to this script -- see module docstring for where
@@ -612,15 +623,27 @@ class CropApp:
         sort_row = ttk.Frame(right)
         sort_row.pack(side=tk.TOP, fill=tk.X, pady=(2, 2))
         ttk.Label(sort_row, text="Sort:").pack(side=tk.LEFT)
-        self.file_sort_var = tk.StringVar(value=FILE_SORT_NAME)
+        self.file_sort_key = FILE_SORT_NAME     # canonical, direction-independent
+        self.file_sort_var = tk.StringVar(value=SORT_MODE_LABELS[FILE_SORT_NAME][0])
         fsort = ttk.Combobox(sort_row, textvariable=self.file_sort_var,
-                             values=FILE_SORT_MODES, width=22, state="readonly")
+                             values=[SORT_MODE_LABELS[k][0] for k in FILE_SORT_MODES],
+                             width=24, state="readonly")
         fsort.pack(side=tk.LEFT, padx=4)
-        fsort.bind("<<ComboboxSelected>>", lambda e: self._sort_items())
+        fsort.bind("<<ComboboxSelected>>", lambda e: self._on_sort_mode_selected())
+        self.fsort_combo = fsort
         self.sort_reverse_var = tk.BooleanVar(value=False)
         self.sort_dir_btn = ttk.Button(sort_row, text="\u25b2", width=3,
                                        command=self._toggle_sort_direction)
         self.sort_dir_btn.pack(side=tk.LEFT)
+
+        opts_row = ttk.Frame(right)
+        opts_row.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
+        self.bury_excluded_var = tk.BooleanVar(value=True)
+        self.float_cropped_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opts_row, text="Bury excluded", variable=self.bury_excluded_var,
+                       command=self._sort_items).pack(side=tk.LEFT)
+        ttk.Checkbutton(opts_row, text="Float cropped", variable=self.float_cropped_var,
+                       command=self._sort_items).pack(side=tk.LEFT, padx=(10, 0))
 
         # buttons reserved at the bottom FIRST so they can't be clipped off
         btns = ttk.Frame(right)
@@ -858,8 +881,7 @@ class CropApp:
         return f"{self._img_pixels(src_name) / 1e6:.1f}"
 
     def _file_sort_key(self):
-        mode = self.file_sort_var.get() if hasattr(self, "file_sort_var") \
-            else FILE_SORT_NAME
+        mode = getattr(self, "file_sort_key", FILE_SORT_NAME)
         if mode == FILE_SORT_MP:
             return lambda it: (-self._img_pixels(it.src_name),
                                it.src_name.lower(), it.uid)
@@ -1087,52 +1109,107 @@ class CropApp:
         return order
 
     def _ordered_items(self):
-        """Full display order: active images sorted by the chosen mode
-        (reversed if the direction toggle is on), then excluded images
-        (always) at the bottom in name order."""
-        excluded = [it for it in self.items if getattr(it, "excluded", False)]
-        active = [it for it in self.items if not getattr(it, "excluded", False)]
-        mode = self.file_sort_var.get() if hasattr(self, "file_sort_var") \
-            else FILE_SORT_NAME
+        """Full display order, in up to three buckets, top to bottom:
+          1. cropped  -- has crop boxes; pulled out only if Float cropped is on
+          2. middle   -- everything not pulled into another bucket
+          3. excluded -- excluded=True; pulled out only if Bury excluded is on
+        Each non-empty bucket is independently sorted by the current mode
+        + direction, then the buckets are concatenated in that fixed
+        order. With both checkboxes off, everything lands in 'middle' and
+        this is just a single sort of the whole list, as before."""
+        bury = (getattr(self, "bury_excluded_var", None) is None
+               or self.bury_excluded_var.get())
+        float_top = (getattr(self, "float_cropped_var", None) is None
+                    or self.float_cropped_var.get())
+
+        cropped, middle, excluded = [], [], []
+        for it in self.items:
+            if bury and getattr(it, "excluded", False):
+                excluded.append(it)
+            elif float_top and len(it.boxes) > 0:
+                cropped.append(it)
+            else:
+                middle.append(it)
+
+        return self._sort_bucket(cropped) + self._sort_bucket(middle) \
+            + self._sort_bucket(excluded)
+
+    def _sort_bucket(self, bucket):
+        """Sort one bucket of items by the current sort mode + direction."""
+        if not bucket:
+            return bucket
+        mode = getattr(self, "file_sort_key", FILE_SORT_NAME)
         if mode == FILE_SORT_SIM and HAS_NUMPY:
-            active = self._similarity_order(active)
+            bucket = self._similarity_order(bucket)
         elif mode == FILE_SORT_QUAL and HAS_NUMPY:
-            ranks = self._quality_badness_ranks(active)
-            active.sort(key=lambda it: (-ranks.get(it.uid, 0.0),
-                                        it.src_name.lower(), it.uid))
+            ranks = self._quality_badness_ranks(bucket)
+            bucket = sorted(bucket, key=lambda it: (-ranks.get(it.uid, 0.0),
+                                                    it.src_name.lower(), it.uid))
         elif mode == FILE_SORT_FACE and HAS_CV2 and HAS_NUMPY:
-            metrics = {it.uid: self._face_metrics(it.src_name) for it in active}
-            active.sort(key=lambda it: (-metrics[it.uid]["included"],
-                                        -metrics[it.uid]["area_frac"],
-                                        it.src_name.lower(), it.uid))
+            metrics = {it.uid: self._face_metrics(it.src_name) for it in bucket}
+            bucket = sorted(bucket, key=lambda it: (-metrics[it.uid]["included"],
+                                                    -metrics[it.uid]["area_frac"],
+                                                    it.src_name.lower(), it.uid))
         else:
-            active.sort(key=self._file_sort_key())
+            bucket = sorted(bucket, key=self._file_sort_key())
         if getattr(self, "sort_reverse_var", None) and self.sort_reverse_var.get():
-            active.reverse()
-        excluded.sort(key=lambda it: (it.src_name.lower(), it.uid))
-        return active + excluded
+            bucket = list(reversed(bucket))
+        return bucket
+
+    def _sort_labels_for_direction(self):
+        idx = 1 if (getattr(self, "sort_reverse_var", None)
+                    and self.sort_reverse_var.get()) else 0
+        return [SORT_MODE_LABELS[k][idx] for k in FILE_SORT_MODES]
+
+    def _refresh_sort_combo(self):
+        """Regenerate the dropdown's labels for the current direction,
+        keeping the same mode selected (just relabeled)."""
+        if not hasattr(self, "fsort_combo"):
+            return
+        idx = 1 if self.sort_reverse_var.get() else 0
+        self.fsort_combo.configure(values=self._sort_labels_for_direction())
+        self.file_sort_var.set(SORT_MODE_LABELS[self.file_sort_key][idx])
+
+    def _on_sort_mode_selected(self):
+        label = self.file_sort_var.get()
+        idx = 1 if self.sort_reverse_var.get() else 0
+        for k in FILE_SORT_MODES:
+            if SORT_MODE_LABELS[k][idx] == label:
+                self.file_sort_key = k
+                break
+        self._sort_items()
+
+    def _set_sort_mode(self, key):
+        """Programmatically change the sort mode (e.g. a fallback after an
+        unavailable mode was picked) and keep the dropdown label in sync."""
+        self.file_sort_key = key
+        self._refresh_sort_combo()
+
+    def _mode_label(self, key):
+        return SORT_MODE_LABELS.get(key, (key, key))[0]
 
     def _toggle_sort_direction(self):
         self.sort_reverse_var.set(not self.sort_reverse_var.get())
         self.sort_dir_btn.configure(
             text="\u25bc" if self.sort_reverse_var.get() else "\u25b2")
+        self._refresh_sort_combo()
         self._sort_items()
 
     def _sort_items(self):
         if not self.items:
             return
-        mode = self.file_sort_var.get()
+        mode = getattr(self, "file_sort_key", FILE_SORT_NAME)
         if mode in (FILE_SORT_SIM, FILE_SORT_QUAL, FILE_SORT_FACE) and not HAS_NUMPY:
             messagebox.showinfo(
                 "Sort needs numpy",
-                f"'{mode}' needs numpy.\n\npip install numpy")
-            self.file_sort_var.set(FILE_SORT_NAME)
+                f"'{self._mode_label(mode)}' needs numpy.\n\npip install numpy")
+            self._set_sort_mode(FILE_SORT_NAME)
             return
         if mode == FILE_SORT_FACE and not HAS_CV2:
             messagebox.showinfo(
                 "Sort needs OpenCV",
-                f"'{mode}' needs OpenCV.\n\npip install opencv-python")
-            self.file_sort_var.set(FILE_SORT_NAME)
+                f"'{self._mode_label(mode)}' needs OpenCV.\n\npip install opencv-python")
+            self._set_sort_mode(FILE_SORT_NAME)
             return
         if mode == FILE_SORT_FACE and HAS_CV2 and not os.path.isfile(YUNET_MODEL_PATH):
             if messagebox.askyesno(
@@ -1141,9 +1218,9 @@ class CropApp:
                     f"\n\nDownload it now (~230 KB, from huggingface.co)?"):
                 self._download_yunet_model(
                     on_done=lambda ok: self._sort_items() if ok
-                    else self.file_sort_var.set(FILE_SORT_NAME))
+                    else self._set_sort_mode(FILE_SORT_NAME))
             else:
-                self.file_sort_var.set(FILE_SORT_NAME)
+                self._set_sort_mode(FILE_SORT_NAME)
             return
         cur_uid = self.items[self.cur_idx].uid \
             if 0 <= self.cur_idx < len(self.items) else None
@@ -1264,15 +1341,18 @@ class CropApp:
         leaving = self.items[self.cur_idx] if self.items else None
         resorted = False
         if self._pending_resort and target_item is not leaving:
-            # stable partition: keep current order, just sink excluded ones.
-            # (Do NOT re-run the full sort here — that would reshuffle the
-            # similarity chain and throw the view around.)
-            active = [it for it in self.items if not it.excluded]
-            excluded = [it for it in self.items if it.excluded]
-            self.items = active + excluded
-            self._populate_tree()
+            bury = (getattr(self, "bury_excluded_var", None) is None
+                   or self.bury_excluded_var.get())
+            if bury:
+                # stable partition: keep current order, just sink excluded.
+                # (Do NOT re-run the full sort here -- that would reshuffle
+                # the similarity chain and throw the view around.)
+                active = [it for it in self.items if not it.excluded]
+                excluded = [it for it in self.items if it.excluded]
+                self.items = active + excluded
+                self._populate_tree()
+                resorted = True
             self._pending_resort = False
-            resorted = True
         idx = self.items.index(target_item)
         self._select_item(idx, from_tree=(from_tree and not resorted))
 
